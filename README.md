@@ -11,6 +11,8 @@ High-performance disk-backed graph engine for semantic code analysis.
 - **Version-aware**: Support for main / __local versions for incremental analysis
 - **BFS/DFS traversal**: Fast graph traversals
 
+Work in progress!
+
 ## Installation
 
 ### As npm package
