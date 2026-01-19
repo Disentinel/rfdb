@@ -1,0 +1,54 @@
+{
+  "name": "@grafema/rfdb",
+  "version": "0.1.0",
+  "description": "High-performance disk-backed graph engine for semantic code analysis",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grafema/rfdb.git"
+  },
+  "keywords": [
+    "graph",
+    "database",
+    "semantic-analysis",
+    "code-analysis",
+    "napi",
+    "rust"
+  ],
+  "author": "Vadim Reshetnikov",
+  "license": "Apache-2.0",
+  "napi": {
+    "name": "rfdb",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "aarch64-apple-darwin"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">= 16"
+  },
+  "scripts": {
+    "build": "cargo build --release --lib --features napi && cp target/release/libgrafema_graph_engine.dylib grafema-graph-engine.node",
+    "build:debug": "cargo build --lib --features napi && cp target/debug/libgrafema_graph_engine.dylib grafema-graph-engine.node",
+    "artifacts": "napi artifacts",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "cargo test",
+    "bench": "cargo bench",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "packageManager": "npm@9.6.7",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ]
+}
