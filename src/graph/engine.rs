@@ -1,7 +1,7 @@
 //! Main GraphEngine implementation with real mmap
 
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::env;
 use std::sync::Mutex;
@@ -110,9 +110,14 @@ pub struct GraphEngine {
 
     // Operation counter for auto-flush
     pub ops_since_flush: usize,
-    
+
     // Timer for last memory check
     last_memory_check: Option<Instant>,
+
+    // Track IDs deleted from segment (not in delta_nodes)
+    // When a node in segment is deleted but not in delta_nodes,
+    // we track it here until next flush
+    deleted_segment_ids: HashSet<u128>,
 }
 
 impl GraphEngine {
@@ -135,6 +140,7 @@ impl GraphEngine {
             metadata: GraphMetadata::default(),
             ops_since_flush: 0,
             last_memory_check: None,
+            deleted_segment_ids: HashSet::new(),
         })
     }
 
@@ -200,6 +206,7 @@ impl GraphEngine {
             metadata,
             ops_since_flush: 0,
             last_memory_check: None,
+            deleted_segment_ids: HashSet::new(),
         })
     }
 
@@ -215,6 +222,9 @@ impl GraphEngine {
             Delta::DeleteNode { id } => {
                 if let Some(node) = self.delta_nodes.get_mut(id) {
                     node.deleted = true;
+                } else {
+                    // Node is in segment (already flushed), track it for deletion
+                    self.deleted_segment_ids.insert(*id);
                 }
             }
             Delta::AddEdge(edge) => {
@@ -251,6 +261,13 @@ impl GraphEngine {
             if !node.deleted {
                 return Some(node.clone());
             }
+            // If deleted in delta, return None
+            return None;
+        }
+
+        // Check if deleted from segment
+        if self.deleted_segment_ids.contains(&id) {
+            return None;
         }
 
         // Then look in segment
@@ -288,6 +305,7 @@ impl GraphEngine {
         self.edges_segment = None;
         self.metadata = GraphMetadata::default();
         self.ops_since_flush = 0;
+        self.deleted_segment_ids.clear();
         tracing::info!("Graph cleared");
     }
 
@@ -558,11 +576,15 @@ impl GraphStore for GraphEngine {
                 (Some(exact), false) => node.node_type.as_ref().map_or(false, |t| t == exact),
                 (None, _) => true,
             };
-            let file_match = query.file_id.map_or(true, |f| node.file_id == f);
+            let file_id_match = query.file_id.map_or(true, |f| node.file_id == f);
+            // File path match (alternative to file_id)
+            let file_path_match = query.file.as_ref().map_or(true, |f| {
+                node.file.as_ref().map_or(false, |node_file| node_file == f)
+            });
             let exported_match = query.exported.map_or(true, |e| node.exported == e);
             let name_match = query.name.as_ref().map_or(true, |n| node.name.as_ref().map_or(false, |node_name| node_name == n));
 
-            let matches = version_match && type_match && file_match && exported_match && name_match;
+            let matches = version_match && type_match && file_id_match && file_path_match && exported_match && name_match;
 
             if matches {
                 result.push(id);
@@ -586,6 +608,11 @@ impl GraphStore for GraphEngine {
                     continue;
                 }
 
+                // Пропустить если удалён (tracked in deleted_segment_ids)
+                if self.deleted_segment_ids.contains(&id) {
+                    continue;
+                }
+
                 // Проверка node_type с поддержкой wildcard
                 let type_match = match (&type_prefix, is_wildcard) {
                     (Some(prefix), true) => segment.get_node_type(idx).map_or(false, |t| t.starts_with(prefix)),
@@ -600,6 +627,14 @@ impl GraphStore for GraphEngine {
                     segment.get_file_id(idx).map_or(false, |fid| fid == f)
                 });
                 if !file_id_match {
+                    continue;
+                }
+
+                // File path match (alternative to file_id)
+                let file_path_match = query.file.as_ref().map_or(true, |f| {
+                    segment.get_file_path(idx).map_or(false, |path| path == f)
+                });
+                if !file_path_match {
                     continue;
                 }
 
@@ -731,6 +766,11 @@ impl GraphStore for GraphEngine {
             for idx in segment.iter_indices() {
                 if !segment.is_deleted(idx) {
                     if let Some(id) = segment.get_id(idx) {
+                        // Skip nodes that were deleted (tracked in deleted_segment_ids)
+                        if self.deleted_segment_ids.contains(&id) {
+                            continue;
+                        }
+
                         // Читаем строковые данные из StringTable если есть
                         let node_type = segment.get_node_type(idx).map(|s| s.to_string());
                         let name = segment.get_name(idx).map(|s| s.to_string());
@@ -840,10 +880,11 @@ impl GraphStore for GraphEngine {
 
         writer.write_metadata(&self.metadata)?;
 
-        // Очищаем delta log
+        // Очищаем delta log и deleted_segment_ids (nodes are now written to new segment)
         self.delta_log.clear();
         self.delta_nodes.clear();
         self.delta_edges.clear();
+        self.deleted_segment_ids.clear();
 
         // Перезагружаем segments
         self.nodes_segment = Some(NodesSegment::open(&self.path.join("nodes.bin"))?);

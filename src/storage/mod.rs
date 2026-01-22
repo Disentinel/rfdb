@@ -85,6 +85,8 @@ pub struct AttrQuery {
     /// Node type as string. Supports wildcard: "http:*" for all http types
     pub node_type: Option<String>,
     pub file_id: Option<u32>,
+    /// File path for filtering (alternative to file_id)
+    pub file: Option<String>,
     pub exported: Option<bool>,
     pub name: Option<String>,
 }

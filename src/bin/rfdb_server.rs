@@ -185,6 +185,7 @@ pub struct WireEdge {
 pub struct WireAttrQuery {
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub file: Option<String>,
     pub exported: Option<bool>,
 }
 
@@ -302,6 +303,7 @@ fn handle_request(engine: &mut GraphEngine, request: Request) -> Response {
                 version: None,
                 node_type: query.node_type,
                 file_id: None,
+                file: query.file,
                 exported: query.exported,
                 name: query.name,
             };
@@ -391,7 +393,7 @@ fn handle_request(engine: &mut GraphEngine, request: Request) -> Response {
             }
         }
         Request::Clear => {
-            // TODO: implement engine.clear() when needed
+            engine.clear();
             Response::Ok { ok: true }
         }
         Request::Ping => {
@@ -415,6 +417,7 @@ fn handle_request(engine: &mut GraphEngine, request: Request) -> Response {
                 version: None,
                 node_type: query.node_type,
                 file_id: None,
+                file: query.file,
                 exported: query.exported,
                 name: query.name,
             };
