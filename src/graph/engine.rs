@@ -105,6 +105,9 @@ pub struct GraphEngine {
     // Adjacency list (built from segments + delta)
     adjacency: HashMap<u128, Vec<usize>>,
 
+    // Reverse adjacency list for backward traversal (dst -> edge indices)
+    reverse_adjacency: HashMap<u128, Vec<usize>>,
+
     // Metadata
     metadata: GraphMetadata,
 
@@ -137,6 +140,7 @@ impl GraphEngine {
             delta_nodes: HashMap::new(),
             delta_edges: Vec::new(),
             adjacency: HashMap::new(),
+            reverse_adjacency: HashMap::new(),
             metadata: GraphMetadata::default(),
             ops_since_flush: 0,
             last_memory_check: None,
@@ -178,12 +182,19 @@ impl GraphEngine {
             GraphMetadata::default()
         };
 
-        // Build adjacency list from segments
+        // Build adjacency and reverse_adjacency lists from segments
         let mut adjacency = HashMap::new();
+        let mut reverse_adjacency = HashMap::new();
         if let Some(ref edges_seg) = edges_segment {
             for idx in 0..edges_seg.edge_count() {
-                if let (Some(src), false) = (edges_seg.get_src(idx), edges_seg.is_deleted(idx)) {
+                if edges_seg.is_deleted(idx) {
+                    continue;
+                }
+                if let Some(src) = edges_seg.get_src(idx) {
                     adjacency.entry(src).or_insert_with(Vec::new).push(idx);
+                }
+                if let Some(dst) = edges_seg.get_dst(idx) {
+                    reverse_adjacency.entry(dst).or_insert_with(Vec::new).push(idx);
                 }
             }
         }
@@ -203,6 +214,7 @@ impl GraphEngine {
             delta_nodes: HashMap::new(),
             delta_edges: Vec::new(),
             adjacency,
+            reverse_adjacency,
             metadata,
             ops_since_flush: 0,
             last_memory_check: None,
@@ -231,11 +243,20 @@ impl GraphEngine {
                 let edge_idx = self.delta_edges.len();
                 self.delta_edges.push(edge.clone());
 
-                // Update adjacency list
+                // Calculate the global edge index (segment + delta)
+                let global_idx = edge_idx + self.edges_segment.as_ref().map_or(0, |s| s.edge_count());
+
+                // Update forward adjacency list
                 self.adjacency
                     .entry(edge.src)
                     .or_insert_with(Vec::new)
-                    .push(edge_idx + self.edges_segment.as_ref().map_or(0, |s| s.edge_count()));
+                    .push(global_idx);
+
+                // Update reverse adjacency list
+                self.reverse_adjacency
+                    .entry(edge.dst)
+                    .or_insert_with(Vec::new)
+                    .push(global_idx);
             }
             Delta::DeleteEdge { src, dst, edge_type } => {
                 for edge in &mut self.delta_edges {
@@ -301,6 +322,7 @@ impl GraphEngine {
         self.delta_nodes.clear();
         self.delta_edges.clear();
         self.adjacency.clear();
+        self.reverse_adjacency.clear();
         self.nodes_segment = None;
         self.edges_segment = None;
         self.metadata = GraphMetadata::default();
@@ -477,6 +499,74 @@ impl GraphEngine {
             }
         }
         Some((None, None, None))
+    }
+
+    /// Get reverse neighbors (sources of incoming edges) for a node
+    /// Returns node IDs that have edges pointing TO this node
+    /// O(degree) complexity using reverse_adjacency
+    pub fn reverse_neighbors(&self, id: u128, edge_types: &[&str]) -> Vec<u128> {
+        let mut result = Vec::new();
+        let segment_edge_count = self.edges_segment.as_ref().map_or(0, |s| s.edge_count());
+
+        // From segment edges via reverse_adjacency
+        if let Some(ref edges_seg) = self.edges_segment {
+            if let Some(edge_indices) = self.reverse_adjacency.get(&id) {
+                for &idx in edge_indices {
+                    // Only process segment edges (idx < segment_edge_count)
+                    if idx >= segment_edge_count {
+                        continue;
+                    }
+                    if edges_seg.is_deleted(idx) {
+                        continue;
+                    }
+                    if let Some(src) = edges_seg.get_src(idx) {
+                        let edge_type = edges_seg.get_edge_type(idx);
+                        if edge_types.is_empty() || edge_type.map_or(false, |et| edge_types.contains(&et)) {
+                            result.push(src);
+                        }
+                    }
+                }
+            }
+        }
+
+        // From delta edges via reverse_adjacency
+        if let Some(edge_indices) = self.reverse_adjacency.get(&id) {
+            for &idx in edge_indices {
+                // Only process delta edges (idx >= segment_edge_count)
+                if idx < segment_edge_count {
+                    continue;
+                }
+                let delta_idx = idx - segment_edge_count;
+                if delta_idx < self.delta_edges.len() {
+                    let edge = &self.delta_edges[delta_idx];
+                    if edge.deleted || edge.dst != id {
+                        continue;
+                    }
+                    let matches = edge_types.is_empty() ||
+                        edge.edge_type.as_deref().map_or(false, |et| edge_types.contains(&et));
+                    if matches {
+                        result.push(edge.src);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Transitive reachability query using BFS
+    /// Returns all nodes reachable from start nodes within max_depth
+    /// If backward=true, traverses edges in reverse direction (find sources)
+    pub fn reachability(&self, start: &[u128], max_depth: usize, edge_types: &[&str], backward: bool) -> Vec<u128> {
+        if backward {
+            traversal::bfs(start, max_depth, |node_id| {
+                self.reverse_neighbors(node_id, edge_types)
+            })
+        } else {
+            traversal::bfs(start, max_depth, |node_id| {
+                self.neighbors(node_id, edge_types)
+            })
+        }
     }
 }
 
@@ -890,12 +980,19 @@ impl GraphStore for GraphEngine {
         self.nodes_segment = Some(NodesSegment::open(&self.path.join("nodes.bin"))?);
         self.edges_segment = Some(EdgesSegment::open(&self.path.join("edges.bin"))?);
 
-        // Rebuild adjacency
+        // Rebuild adjacency and reverse_adjacency
         self.adjacency.clear();
+        self.reverse_adjacency.clear();
         if let Some(ref edges_seg) = self.edges_segment {
             for idx in 0..edges_seg.edge_count() {
-                if let (Some(src), false) = (edges_seg.get_src(idx), edges_seg.is_deleted(idx)) {
+                if edges_seg.is_deleted(idx) {
+                    continue;
+                }
+                if let Some(src) = edges_seg.get_src(idx) {
                     self.adjacency.entry(src).or_insert_with(Vec::new).push(idx);
+                }
+                if let Some(dst) = edges_seg.get_dst(idx) {
+                    self.reverse_adjacency.entry(dst).or_insert_with(Vec::new).push(idx);
                 }
             }
         }
@@ -990,59 +1087,63 @@ impl GraphStore for GraphEngine {
 
     /// Get all incoming edges to a node
     /// Returns Vec<EdgeRecord> with edges where dst == node_id
+    /// O(degree) complexity using reverse_adjacency
     fn get_incoming_edges(&self, node_id: u128, edge_types: Option<&[&str]>) -> Vec<EdgeRecord> {
         let mut result = Vec::new();
+        let segment_edge_count = self.edges_segment.as_ref().map_or(0, |s| s.edge_count());
 
-        // From delta_edges
-        for edge in &self.delta_edges {
-            if edge.deleted || edge.dst != node_id {
-                continue;
-            }
-
-            // Filter by edge type if specified
-            if let Some(types) = edge_types {
-                if !edge.edge_type.as_deref().map_or(false, |et| types.contains(&et)) {
-                    continue;
-                }
-            }
-
-            result.push(edge.clone());
-        }
-
-        // From edges_segment - need to scan all edges
-        // TODO: Build reverse adjacency list for better performance
-        if let Some(ref edges_seg) = self.edges_segment {
-            for idx in 0..edges_seg.edge_count() {
-                if edges_seg.is_deleted(idx) {
-                    continue;
-                }
-
-                if let (Some(src), Some(dst)) = (
-                    edges_seg.get_src(idx),
-                    edges_seg.get_dst(idx),
-                ) {
-                    if dst != node_id {
-                        continue;
-                    }
-
-                    let edge_type = edges_seg.get_edge_type(idx);
-
-                    // Filter by edge type if specified
-                    if let Some(types) = edge_types {
-                        if !edge_type.map_or(false, |et| types.contains(&et)) {
+        // Use reverse_adjacency for O(degree) lookup
+        if let Some(edge_indices) = self.reverse_adjacency.get(&node_id) {
+            for &idx in edge_indices {
+                if idx < segment_edge_count {
+                    // Edge is in segment
+                    if let Some(ref edges_seg) = self.edges_segment {
+                        if edges_seg.is_deleted(idx) {
                             continue;
                         }
-                    }
 
-                    let metadata = edges_seg.get_metadata(idx);
-                    result.push(EdgeRecord {
-                        src,
-                        dst,
-                        edge_type: edge_type.map(|s| s.to_string()),
-                        version: "main".to_string(), // TODO: Store version in segment
-                        metadata: metadata.map(|s| s.to_string()),
-                        deleted: false,
-                    });
+                        if let (Some(src), Some(dst)) = (
+                            edges_seg.get_src(idx),
+                            edges_seg.get_dst(idx),
+                        ) {
+                            let edge_type = edges_seg.get_edge_type(idx);
+
+                            // Filter by edge type if specified
+                            if let Some(types) = edge_types {
+                                if !edge_type.map_or(false, |et| types.contains(&et)) {
+                                    continue;
+                                }
+                            }
+
+                            let metadata = edges_seg.get_metadata(idx);
+                            result.push(EdgeRecord {
+                                src,
+                                dst,
+                                edge_type: edge_type.map(|s| s.to_string()),
+                                version: "main".to_string(),
+                                metadata: metadata.map(|s| s.to_string()),
+                                deleted: false,
+                            });
+                        }
+                    }
+                } else {
+                    // Edge is in delta
+                    let delta_idx = idx - segment_edge_count;
+                    if delta_idx < self.delta_edges.len() {
+                        let edge = &self.delta_edges[delta_idx];
+                        if edge.deleted || edge.dst != node_id {
+                            continue;
+                        }
+
+                        // Filter by edge type if specified
+                        if let Some(types) = edge_types {
+                            if !edge.edge_type.as_deref().map_or(false, |et| types.contains(&et)) {
+                                continue;
+                            }
+                        }
+
+                        result.push(edge.clone());
+                    }
                 }
             }
         }
@@ -1350,5 +1451,320 @@ mod tests {
             assert_eq!(engine.path.extension().and_then(|s| s.to_str()), Some("rfdb"));
             assert_eq!(engine.node_count(), 1);
         }
+    }
+
+    // ============================================================
+    // REG-115: Reachability Queries Tests
+    // ============================================================
+
+    /// Helper function to create a test node
+    fn make_test_node(id: u128, name: &str, node_type: &str) -> NodeRecord {
+        NodeRecord {
+            id,
+            node_type: Some(node_type.to_string()),
+            file_id: 0,
+            name_offset: 0,
+            version: "main".to_string(),
+            exported: false,
+            replaces: None,
+            deleted: false,
+            name: Some(name.to_string()),
+            file: Some("test.js".to_string()),
+            metadata: None,
+        }
+    }
+
+    /// Helper function to create a test edge
+    fn make_test_edge(src: u128, dst: u128, edge_type: &str) -> EdgeRecord {
+        EdgeRecord {
+            src,
+            dst,
+            edge_type: Some(edge_type.to_string()),
+            version: "main".to_string(),
+            metadata: None,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn test_reverse_adjacency_basic() {
+        // Graph: A --CALLS--> B, C --CALLS--> B, D --IMPORTS--> B
+        // reverse_neighbors(B, ["CALLS"]) should return [A, C] (not D)
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_reverse_adj");
+
+        let mut engine = GraphEngine::create(&db_path).unwrap();
+
+        let [a, b, c, d]: [u128; 4] = [1, 2, 3, 4];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "funcA", "FUNCTION"),
+            make_test_node(b, "funcB", "FUNCTION"),
+            make_test_node(c, "funcC", "FUNCTION"),
+            make_test_node(d, "moduleD", "MODULE"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, b, "CALLS"),
+            make_test_edge(c, b, "CALLS"),
+            make_test_edge(d, b, "IMPORTS"),
+        ], false);
+
+        let callers = engine.reverse_neighbors(b, &["CALLS"]);
+
+        assert_eq!(callers.len(), 2);
+        assert!(callers.contains(&a));
+        assert!(callers.contains(&c));
+        assert!(!callers.contains(&d));
+
+        // Empty filter returns all
+        let all_sources = engine.reverse_neighbors(b, &[]);
+        assert_eq!(all_sources.len(), 3);
+    }
+
+    #[test]
+    fn test_reachability_forward() {
+        // Graph: A -> B -> C -> D -> E
+        // reachability([A], 2, [], false) = [A, B, C]
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b, c, d, e]: [u128; 5] = [1, 2, 3, 4, 5];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+            make_test_node(c, "C", "FUNCTION"),
+            make_test_node(d, "D", "FUNCTION"),
+            make_test_node(e, "E", "FUNCTION"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, b, "CALLS"),
+            make_test_edge(b, c, "CALLS"),
+            make_test_edge(c, d, "CALLS"),
+            make_test_edge(d, e, "CALLS"),
+        ], false);
+
+        let result_2 = engine.reachability(&[a], 2, &[], false);
+        assert_eq!(result_2.len(), 3);
+        assert!(result_2.contains(&a) && result_2.contains(&b) && result_2.contains(&c));
+
+        let result_10 = engine.reachability(&[a], 10, &[], false);
+        assert_eq!(result_10.len(), 5);
+    }
+
+    #[test]
+    fn test_reachability_backward() {
+        // Graph: A -> D, B -> D, C -> D
+        // reachability([D], 1, [], true) = [D, A, B, C]
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b, c, d]: [u128; 4] = [1, 2, 3, 4];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+            make_test_node(c, "C", "FUNCTION"),
+            make_test_node(d, "D", "FUNCTION"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, d, "CALLS"),
+            make_test_edge(b, d, "CALLS"),
+            make_test_edge(c, d, "CALLS"),
+        ], false);
+
+        let result = engine.reachability(&[d], 1, &[], true);
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&d) && result.contains(&a) && result.contains(&b) && result.contains(&c));
+    }
+
+    #[test]
+    fn test_reachability_with_cycles() {
+        // Diamond: A->B, A->C, B->D, C->D
+        // Each node should appear exactly once
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b, c, d]: [u128; 4] = [1, 2, 3, 4];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+            make_test_node(c, "C", "FUNCTION"),
+            make_test_node(d, "D", "FUNCTION"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, b, "CALLS"),
+            make_test_edge(a, c, "CALLS"),
+            make_test_edge(b, d, "CALLS"),
+            make_test_edge(c, d, "CALLS"),
+        ], false);
+
+        let forward = engine.reachability(&[a], 10, &[], false);
+        assert_eq!(forward.len(), 4);
+
+        let backward = engine.reachability(&[d], 10, &[], true);
+        assert_eq!(backward.len(), 4);
+    }
+
+    #[test]
+    fn test_reverse_adjacency_persists_after_flush() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test");
+
+        let [a, b, c]: [u128; 3] = [1, 2, 3];
+
+        {
+            let mut engine = GraphEngine::create(&db_path).unwrap();
+            engine.add_nodes(vec![
+                make_test_node(a, "A", "FUNCTION"),
+                make_test_node(b, "B", "FUNCTION"),
+                make_test_node(c, "C", "FUNCTION"),
+            ]);
+            engine.add_edges(vec![
+                make_test_edge(a, c, "CALLS"),
+                make_test_edge(b, c, "CALLS"),
+            ], false);
+            engine.flush().unwrap();
+        }
+
+        {
+            let engine = GraphEngine::open(&db_path).unwrap();
+            let callers = engine.reverse_neighbors(c, &["CALLS"]);
+            assert_eq!(callers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_reachability_edge_type_filter() {
+        // A --CALLS--> B, A --IMPORTS--> C, B --CALLS--> D
+        // reachability([A], 10, ["CALLS"], false) = [A, B, D] (not C)
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b, c, d]: [u128; 4] = [1, 2, 3, 4];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+            make_test_node(c, "C", "MODULE"),
+            make_test_node(d, "D", "FUNCTION"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, b, "CALLS"),
+            make_test_edge(a, c, "IMPORTS"),
+            make_test_edge(b, d, "CALLS"),
+        ], false);
+
+        let result = engine.reachability(&[a], 10, &["CALLS"], false);
+        assert_eq!(result.len(), 3);
+        assert!(!result.contains(&c));
+    }
+
+    #[test]
+    fn test_reachability_backward_with_filter() {
+        // Test: Backward traversal with edge type filtering
+        //
+        // Graph: A --PASSES_ARGUMENT--> Z
+        //        B --CALLS--> Z
+        //
+        // reachability([Z], 1, ["PASSES_ARGUMENT"], backward=true)
+        //   should return [Z, A] (not B because edge type differs)
+
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b, z]: [u128; 3] = [1, 2, 3];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+            make_test_node(z, "Z", "FUNCTION"),
+        ]);
+
+        engine.add_edges(vec![
+            make_test_edge(a, z, "PASSES_ARGUMENT"),
+            make_test_edge(b, z, "CALLS"),
+        ], false);
+
+        // Backward from Z, filtering only PASSES_ARGUMENT edges
+        let result = engine.reachability(&[z], 10, &["PASSES_ARGUMENT"], true);
+
+        assert_eq!(result.len(), 2, "Should find Z and A only");
+        assert!(result.contains(&z), "Z (start) should be included");
+        assert!(result.contains(&a), "A should be found (PASSES_ARGUMENT edge)");
+        assert!(!result.contains(&b), "B should NOT be found (CALLS edge filtered out)");
+    }
+
+    #[test]
+    fn test_reachability_empty_start() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let forward = engine.reachability(&[], 10, &[], false);
+        assert!(forward.is_empty());
+
+        let backward = engine.reachability(&[], 10, &[], true);
+        assert!(backward.is_empty());
+    }
+
+    #[test]
+    fn test_reachability_depth_zero() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let mut engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        let [a, b]: [u128; 2] = [1, 2];
+
+        engine.add_nodes(vec![
+            make_test_node(a, "A", "FUNCTION"),
+            make_test_node(b, "B", "FUNCTION"),
+        ]);
+        engine.add_edges(vec![make_test_edge(a, b, "CALLS")], false);
+
+        let result = engine.reachability(&[a], 0, &[], false);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&a));
+    }
+
+    #[test]
+    fn test_reachability_nonexistent_start() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let engine = GraphEngine::create(temp_dir.path().join("test")).unwrap();
+
+        // Non-existent node ID should still be returned (start node included)
+        // but no neighbors
+        let result = engine.reachability(&[999], 10, &[], false);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&999));
     }
 }

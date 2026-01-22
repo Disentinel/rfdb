@@ -70,6 +70,16 @@ pub enum Request {
         #[serde(rename = "edgeTypes")]
         edge_types: Vec<String>,
     },
+    Reachability {
+        #[serde(rename = "startIds")]
+        start_ids: Vec<String>,
+        #[serde(rename = "maxDepth")]
+        max_depth: u32,
+        #[serde(rename = "edgeTypes")]
+        edge_types: Vec<String>,
+        #[serde(default)]
+        backward: bool,
+    },
     Dfs {
         #[serde(rename = "startIds")]
         start_ids: Vec<String>,
@@ -327,6 +337,15 @@ fn handle_request(engine: &mut GraphEngine, request: Request) -> Response {
             let start: Vec<u128> = start_ids.iter().map(|s| string_to_id(s)).collect();
             let edge_types_refs: Vec<&str> = edge_types.iter().map(|s| s.as_str()).collect();
             let ids: Vec<String> = engine.bfs(&start, max_depth as usize, &edge_types_refs)
+                .into_iter()
+                .map(id_to_string)
+                .collect();
+            Response::Ids { ids }
+        }
+        Request::Reachability { start_ids, max_depth, edge_types, backward } => {
+            let start: Vec<u128> = start_ids.iter().map(|s| string_to_id(s)).collect();
+            let edge_types_refs: Vec<&str> = edge_types.iter().map(|s| s.as_str()).collect();
+            let ids: Vec<String> = engine.reachability(&start, max_depth as usize, &edge_types_refs, backward)
                 .into_iter()
                 .map(id_to_string)
                 .collect();
