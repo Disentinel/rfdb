@@ -41,6 +41,9 @@ crossbeam-channel = "0.5"
 anyhow = "1.0"
 thiserror = "1.0"
 
+# Signal handling for graceful shutdown
+signal-hook = "0.3"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"

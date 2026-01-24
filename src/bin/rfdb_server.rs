@@ -713,6 +713,31 @@ fn main() {
     let listener = UnixListener::bind(socket_path).expect("Failed to bind socket");
     eprintln!("[rfdb-server] Listening on {}", socket_path);
 
+    // Set up signal handler for graceful shutdown
+    let engine_for_signal = Arc::clone(&engine);
+    let socket_path_for_signal = socket_path.to_string();
+    let mut signals = signal_hook::iterator::Signals::new(&[
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]).expect("Failed to register signal handlers");
+
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            eprintln!("[rfdb-server] Received signal {}, flushing...", sig);
+
+            if let Ok(mut guard) = engine_for_signal.write() {
+                match guard.flush() {
+                    Ok(()) => eprintln!("[rfdb-server] Flush complete"),
+                    Err(e) => eprintln!("[rfdb-server] Flush failed: {}", e),
+                }
+            }
+
+            let _ = std::fs::remove_file(&socket_path_for_signal);
+            eprintln!("[rfdb-server] Exiting");
+            std::process::exit(0);
+        }
+    });
+
     // Accept connections
     let mut client_id = 0;
     for stream in listener.incoming() {
